@@ -4,7 +4,7 @@
 定义数据库表对应的ORM模型，以及数据访问的工具方法
 """
 
-from sqlalchemy import func, case, and_
+from sqlalchemy import func, case, and_, not_
 from app.extensions import db
 
 
@@ -115,7 +115,7 @@ class HouseDAO:
     @staticmethod
     def get_all_batch_ids():
         """
-        获取所有批次ID列表
+        获取所有批次ID列表，排除包含_error的错误批次
         
         返回:
             list: 批次ID列表，按创建时间降序排列
@@ -123,6 +123,9 @@ class HouseDAO:
         result = db.session.query(
             RentHouse.batch_id,
             func.min(RentHouse.saved_at).label('first_saved_at')
+        ).filter(
+            # 排除包含_error的批次
+            not_(RentHouse.batch_id.like('%_error%'))
         ).group_by(
             RentHouse.batch_id
         ).order_by(
@@ -132,28 +135,109 @@ class HouseDAO:
         return [row.batch_id for row in result]
     
     @staticmethod
-    def get_house_count_by_batch(batch_id):
+    def _build_filter_conditions(batch_id, detail_districts=None, bankuais=None):
         """
-        获取指定批次的房源总数
+        构建筛选条件的辅助方法
+        
+        参数:
+            batch_id: 批次ID
+            detail_districts: 详情区域筛选列表（多选）
+            bankuais: 板块筛选列表（多选）
+            
+        返回:
+            list: 筛选条件列表
+        """
+        conditions = [
+            RentHouse.batch_id == batch_id
+        ]
+        
+        # 添加详情区域筛选
+        if detail_districts:
+            conditions.append(RentHouse.detail_district.in_(detail_districts))
+        
+        # 添加板块筛选
+        if bankuais:
+            conditions.append(RentHouse.bankuai.in_(bankuais))
+        
+        return conditions
+    
+    @staticmethod
+    def get_detail_districts_by_batch(batch_id):
+        """
+        获取指定批次的所有详情区域列表
         
         参数:
             batch_id: 批次ID
             
         返回:
+            list: 详情区域名称列表
+        """
+        result = db.session.query(
+            RentHouse.detail_district
+        ).filter(
+            RentHouse.batch_id == batch_id,
+            RentHouse.detail_district != ''
+        ).group_by(
+            RentHouse.detail_district
+        ).order_by(
+            RentHouse.detail_district
+        ).all()
+        
+        return [row.detail_district for row in result]
+    
+    @staticmethod
+    def get_bankuais_by_batch(batch_id):
+        """
+        获取指定批次的所有板块列表
+        
+        参数:
+            batch_id: 批次ID
+            
+        返回:
+            list: 板块名称列表
+        """
+        result = db.session.query(
+            RentHouse.bankuai
+        ).filter(
+            RentHouse.batch_id == batch_id,
+            RentHouse.bankuai != ''
+        ).group_by(
+            RentHouse.bankuai
+        ).order_by(
+            RentHouse.bankuai
+        ).all()
+        
+        return [row.bankuai for row in result]
+    
+    @staticmethod
+    def get_house_count_by_batch(batch_id, detail_districts=None, bankuais=None):
+        """
+        获取指定批次的房源总数，支持筛选条件
+        
+        参数:
+            batch_id: 批次ID
+            detail_districts: 详情区域筛选列表（多选）
+            bankuais: 板块筛选列表（多选）
+            
+        返回:
             int: 房源数量
         """
+        conditions = HouseDAO._build_filter_conditions(batch_id, detail_districts, bankuais)
+        
         return db.session.query(func.count(RentHouse.id)).filter(
-            RentHouse.batch_id == batch_id
+            *conditions
         ).scalar()
     
     @staticmethod
-    def get_distribution_by_dimension(batch_id, dimension):
+    def get_distribution_by_dimension(batch_id, dimension, detail_districts=None, bankuais=None):
         """
-        按指定维度统计房源数量分布
+        按指定维度统计房源数量分布，支持筛选条件
         
         参数:
             batch_id: 批次ID
             dimension: 统计维度，可选值: 'district'(区域), 'bankuai'(板块), 'community'(小区)
+            detail_districts: 详情区域筛选列表（多选）
+            bankuais: 板块筛选列表（多选）
             
         返回:
             list: 包含维度名称和房源数量的字典列表
@@ -166,12 +250,15 @@ class HouseDAO:
         
         dimension_col = dimension_map.get(dimension, RentHouse.district)
         
+        # 构建基础条件
+        conditions = HouseDAO._build_filter_conditions(batch_id, detail_districts, bankuais)
+        conditions.append(dimension_col != '')
+        
         result = db.session.query(
             dimension_col.label('name'),
             func.count(RentHouse.id).label('count')
         ).filter(
-            RentHouse.batch_id == batch_id,
-            dimension_col != ''
+            *conditions
         ).group_by(
             dimension_col
         ).order_by(
@@ -233,13 +320,15 @@ class HouseDAO:
         return None
     
     @staticmethod
-    def get_price_distribution(batch_id, bins=None):
+    def get_price_distribution(batch_id, bins=None, detail_districts=None, bankuais=None):
         """
-        获取租金区间分布
+        获取租金区间分布，支持筛选条件
         
         参数:
             batch_id: 批次ID
             bins: 价格区间列表，默认使用预设区间
+            detail_districts: 详情区域筛选列表（多选）
+            bankuais: 板块筛选列表（多选）
             
         返回:
             list: 包含区间名称和房源数量的字典列表
@@ -247,28 +336,13 @@ class HouseDAO:
         if bins is None:
             bins = [0, 2000, 4000, 6000, 8000, 10000, 15000, 20000, float('inf')]
         
-        # 构建CASE WHEN语句来统计每个区间的数量
-        cases = []
-        for i in range(len(bins) - 1):
-            lower = bins[i]
-            upper = bins[i + 1]
-            cases.append(
-                case(
-                    (and_(
-                        func.cast(func.substr(RentHouse.total_price, 1, 
-                                             func.instr(RentHouse.total_price, '元') - 1),
-                                  db.Integer) >= lower,
-                        func.cast(func.substr(RentHouse.total_price, 1, 
-                                             func.instr(RentHouse.total_price, '元') - 1),
-                                  db.Integer) < upper
-                    ), 1)
-                ).label(f'bin_{i}')
-            )
+        # 构建筛选条件
+        conditions = HouseDAO._build_filter_conditions(batch_id, detail_districts, bankuais)
+        conditions.append(RentHouse.total_price != '')
         
-        # 由于SQL中价格处理较复杂，使用Python处理
+        # 查询数据
         houses = db.session.query(RentHouse.total_price).filter(
-            RentHouse.batch_id == batch_id,
-            RentHouse.total_price != ''
+            *conditions
         ).all()
         
         distribution = {}
@@ -296,13 +370,15 @@ class HouseDAO:
         return [{'name': k, 'count': v} for k, v in distribution.items()]
     
     @staticmethod
-    def get_area_distribution(batch_id, bins=None):
+    def get_area_distribution(batch_id, bins=None, detail_districts=None, bankuais=None):
         """
-        获取面积区间分布
+        获取面积区间分布，支持筛选条件
         
         参数:
             batch_id: 批次ID
             bins: 面积区间列表，默认使用预设区间
+            detail_districts: 详情区域筛选列表（多选）
+            bankuais: 板块筛选列表（多选）
             
         返回:
             list: 包含区间名称和房源数量的字典列表
@@ -310,9 +386,13 @@ class HouseDAO:
         if bins is None:
             bins = [0, 30, 50, 70, 90, 120, 150, 200, float('inf')]
         
+        # 构建筛选条件
+        conditions = HouseDAO._build_filter_conditions(batch_id, detail_districts, bankuais)
+        conditions.append(RentHouse.area != '')
+        
+        # 查询数据
         houses = db.session.query(RentHouse.area).filter(
-            RentHouse.batch_id == batch_id,
-            RentHouse.area != ''
+            *conditions
         ).all()
         
         distribution = {}
@@ -340,12 +420,14 @@ class HouseDAO:
         return [{'name': k, 'count': v} for k, v in distribution.items()]
     
     @staticmethod
-    def get_batch_stats(batch_ids):
+    def get_batch_stats(batch_ids, detail_districts=None, bankuais=None):
         """
-        获取多个批次的统计数据，用于多批次对比
+        获取多个批次的统计数据，用于多批次对比，支持筛选条件
         
         参数:
             batch_ids: 批次ID列表
+            detail_districts: 详情区域筛选列表（多选）
+            bankuais: 板块筛选列表（多选）
             
         返回:
             dict: 包含各批次统计数据的字典
@@ -354,16 +436,23 @@ class HouseDAO:
         
         for batch_id in batch_ids:
             # 获取基础统计
-            total_count = HouseDAO.get_house_count_by_batch(batch_id)
+            total_count = HouseDAO.get_house_count_by_batch(
+                batch_id, detail_districts, bankuais
+            )
+            
+            # 构建筛选条件
+            conditions = HouseDAO._build_filter_conditions(
+                batch_id, detail_districts, bankuais
+            )
+            conditions.append(RentHouse.total_price != '')
+            conditions.append(RentHouse.area != '')
             
             # 获取价格数据
             houses = db.session.query(
                 RentHouse.total_price,
                 RentHouse.area
             ).filter(
-                RentHouse.batch_id == batch_id,
-                RentHouse.total_price != '',
-                RentHouse.area != ''
+                *conditions
             ).all()
             
             prices = []
